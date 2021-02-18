@@ -1,0 +1,32 @@
+{
+    "do_train": true,
+    "use_cuda": true,
+    "gradient_accumulation_steps": 32,
+    "train_batch_size": 128,
+    "seed": 2021,
+    "do_eval": false,
+    "do_validation": true,
+    "clfs": [
+        "Quantity",
+        "MeasuredEntity",
+        "MeasuredProperty",
+        "Unit",
+        "QuantityQualifier",
+        "MeasuredEntityQualifier",
+        "MeasuredPropertyQualifier"
+    ],
+    "data_dir": "../MeasEval/data/",
+    "num_train_epochs": 50,
+    "eval_batch_size": 32,
+    "best_result_threshold": 0.4,
+    "model_name": "roberta-large",
+    "quant_ncls": 10,
+    "max_seq_len": 256,
+    "quant_classes": [
+        "HasTolerance", "IsApproximate", "IsCount", "IsList", "IsMean", "IsMeanHasTolerance", "IsMeanIsRange", "IsMedian", "IsRange", "IsRangeHasTolerance"
+    ],
+    "concat_quantity_embeddings": false,
+    "pool_type": "max",
+    "split_qualifier": true,
+    "lr_scheduler": "linear_warmup"
+}
