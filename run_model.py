@@ -59,8 +59,8 @@ def predict(
 
     os.makedirs(output_dir, exist_ok=True)
     model.eval()
-    clfs = sorted(model.local_config['clfs'])
-    device = torch.device('cuda') if model.local_config['use_cuda'] else torch.device('cpu')
+    clfs = sorted(args.clfs)
+    device = torch.device('cuda') if not args.no_cuda else torch.device('cpu')
 
     metrics = defaultdict(float)
     nb_eval_steps = 0
@@ -74,7 +74,6 @@ def predict(
         )):
 
         batch = tuple([elem.to(device) for elem in batch])
-
         input_ids, input_mask, token_type_ids, b_clfs_labels, b_quant_labels = batch
 
         with torch.no_grad():
@@ -106,7 +105,7 @@ def predict(
     clfs_preds = np.argmax(clfs_preds, axis=1)  # n_examples x all_ncls
 
     predictions = defaultdict(list)
-    quant_id_to_labs = {i: lab for i, lab in enumerate(sorted(model.local_config['quant_classes']))}
+    quant_id_to_labs = {i: lab for i, lab in enumerate(sorted(args.quant_classes))}
     annotSet = 1
     T = {'Quantity': 'T1', 'MeasuredProperty': 'T2', 'MeasuredEntity': 'T3'}
     for ex_id, (ex_feature, ex_clfs_preds, ex_quant_preds) in enumerate(zip(eval_fearures, clfs_preds, quant_scores)):
@@ -227,49 +226,67 @@ def predict(
 
 
 def main(args):
-    local_config = json.load(open(args.local_config_path))
-    if os.path.exists(args.output_dir) and local_config['do_train']:
+    if not args.dont_split_qualifier:
+        args.clfs = [
+            "Quantity",
+            "MeasuredEntity",
+            "MeasuredProperty",
+            "Unit",
+            "QuantityQualifier",
+            "MeasuredEntityQualifier",
+            "MeasuredPropertyQualifier"
+        ]
+    else:
+        args.clfs = [
+            "Quantity",
+            "MeasuredEntity",
+            "MeasuredProperty",
+            "Unit",
+            "Qualifier"
+            ]
+    args.add_double_sentences = args.add_double_sentences.lower() == 'true'
+    if args.do_train and os.path.exists(args.output_dir):
         from glob import glob
         model_weights = glob(os.path.join(args.output_dir, '*.bin'))
         if model_weights:
             print(f'{model_weights}: already computed: skipping ...')
             return
         else:
-            print(f'already existing {args.output_dir}. but without model weights ...')
+            print(f'already existing {args.output_dir} but without model weights: skipping ...')
             return
 
-    device = torch.device("cuda" if local_config['use_cuda'] else "cpu")
+    device = torch.device("cuda" if not args.no_cuda else "cpu")
     n_gpu = torch.cuda.device_count()
 
-    if local_config['gradient_accumulation_steps'] < 1:
+    if args.gradient_accumulation_steps < 1:
         raise ValueError(
             "gradient_accumulation_steps parameter should be >= 1"
         )
 
-    local_config['train_batch_size'] = \
-        local_config['train_batch_size'] // local_config['gradient_accumulation_steps']
+    args.train_batch_size = \
+        args.train_batch_size // args.gradient_accumulation_steps
 
-    if local_config['do_train']:
-        random.seed(local_config['seed'])
-        np.random.seed(local_config['seed'])
-        torch.manual_seed(local_config['seed'])
+    if args.do_train:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
 
     if n_gpu > 0:
-        torch.cuda.manual_seed_all(local_config['seed'])
+        torch.cuda.manual_seed_all(args.seed)
 
-    if not local_config['do_train'] and not local_config['do_eval']:
+    if not args.do_train and not args.do_eval:
         raise ValueError(
             "At least one of `do_train` or `do_eval` must be True."
         )
 
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    elif local_config['do_train'] or local_config['do_validation']:
+    elif args.do_train or args.do_validation:
         raise ValueError(args.output_dir, 'output_dir already exists')
 
     suffix = datetime.now().isoformat().replace('-', '_').replace(
         ':', '_').split('.')[0].replace('T', '-')
-    if local_config['do_train']:
+    if args.do_train:
         train_writer = SummaryWriter(
             log_dir=os.path.join(
                 args.output_dir, f'tensorboard-{suffix}', 'train'
@@ -293,31 +310,33 @@ def main(args):
         )
 
     logger.info(args)
-    logger.info(json.dumps(local_config, indent=4))
+    logger.info(json.dumps(vars(args), indent=4))
     logger.info("device: {}, n_gpu: {}".format(device, n_gpu))
 
 
-    clfs = sorted(local_config['clfs'])
-    id2classifier = {i: classifier for i, classifier in enumerate(clfs)}
+    clfs = sorted(args.clfs)
 
     model_name = args.model_name
-    data_processor = DataProcessor(os.path.join(local_config['data_dir'], 'train/text/'), split_qualifier=local_config['split_qualifier'], add_double_sentences=local_config['add_double_sentences'])
+    data_processor = DataProcessor(os.path.join(args.data_dir, 'train/text/'), split_qualifier=not args.dont_split_qualifier, add_double_sentences=args.add_double_sentences)
 
-    train_docs, train_annotations = os.path.join(local_config['data_dir'], 'train/text'), os.path.join(local_config['data_dir'], 'train/tsv')
+    train_docs, train_annotations = os.path.join(args.data_dir, 'train/text'), os.path.join(args.data_dir, 'train/tsv')
+    dev_docs, dev_annotations = os.path.join(args.data_dir, 'trial/txt'), os.path.join(args.data_dir, 'trial/tsv')
+    test_docs, test_annotations = os.path.join(args.data_dir, 'eval/text'), os.path.join(args.data_dir, 'eval/single_sents_tsv')
 
-    dev_docs, dev_annotations = os.path.join(local_config['data_dir'], 'trial/txt'), os.path.join(local_config['data_dir'], 'trial/tsv')
-
-    if local_config['do_train']:
-
+    if args.do_train:
         config = configs[model_name]
         config = config.from_pretrained(
             model_name,
             hidden_dropout_prob=args.dropout
         )
         print(model_name)
+        if args.ckpt_path != '':
+            model_path = args.ckpt_path
+        else:
+            model_path = model_name
         model = models[model_name].from_pretrained(
-            model_name, cache_dir=str(PYTORCH_PRETRAINED_BERT_CACHE),
-            local_config=local_config,
+            model_path, cache_dir=str(PYTORCH_PRETRAINED_BERT_CACHE),
+            args=args,
             data_processor=data_processor,
             config=config
         )
@@ -325,12 +344,11 @@ def main(args):
         param_optimizer = list(model.named_parameters())
 
         no_decay = ['bias', 'LayerNorm.weight']
-        loss_weights = ['clfs_weights']
         optimizer_grouped_parameters = [
             {
                 'params': [
                     param for name, param in param_optimizer
-                    if not any(nd in name for nd in no_decay + loss_weights)
+                    if not any(nd in name for nd in no_decay)
                 ],
                 'weight_decay': float(args.weight_decay)
             },
@@ -338,14 +356,6 @@ def main(args):
                 'params': [
                     param for name, param in param_optimizer
                     if any(nd in name for nd in no_decay)
-                ],
-                'weight_decay': 0.0
-            },
-            {
-                'lr': 1e-4,
-                'params': [
-                    param for name, param in param_optimizer
-                    if any(nd in name for nd in loss_weights)
                 ],
                 'weight_decay': 0.0
             }
@@ -360,7 +370,7 @@ def main(args):
         )
 
         train_features = model.convert_dataset_to_features(
-            train_docs, train_annotations, logger
+            train_docs, train_annotations, logger, add_question=args.add_question
         )
 
         if args.train_mode == 'sorted' or args.train_mode == 'random_sorted':
@@ -371,21 +381,21 @@ def main(args):
             random.shuffle(train_features)
 
         train_dataloader, clfs_labels_ids, quant_labels_ids = \
-            get_dataloader_and_tensors(train_features, local_config['train_batch_size'])
+            get_dataloader_and_tensors(train_features, args.train_batch_size)
         train_batches = [batch for batch in train_dataloader]
 
         num_train_optimization_steps = \
-            len(train_batches) // local_config['gradient_accumulation_steps'] * \
-                local_config['num_train_epochs']
+            len(train_batches) // args.gradient_accumulation_steps * \
+                args.num_train_epochs
 
-        warmup_steps = int(0.1 * num_train_optimization_steps)
-        if local_config['lr_scheduler'] == 'linear_warmup':
+        warmup_steps = int(args.warmup_proportion * num_train_optimization_steps)
+        if args.lr_scheduler == 'linear_warmup':
             scheduler = get_linear_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=warmup_steps,
                 num_training_steps=num_train_optimization_steps
             )
-        elif local_config['lr_scheduler'] == 'constant_warmup':
+        elif args.lr_scheduler == 'constant_warmup':
             scheduler = get_constant_schedule_with_warmup(
                 optimizer,
                 num_warmup_steps=warmup_steps
@@ -393,21 +403,29 @@ def main(args):
 
         logger.info("***** Training *****")
         logger.info("  Num examples = %d", len(train_features))
-        logger.info("  Batch size = %d", local_config['train_batch_size'])
+        logger.info("  Batch size = %d", args.train_batch_size)
         logger.info("  Num steps = %d", num_train_optimization_steps)
 
-        if local_config['do_validation']:
+        if args.do_validation:
             dev_features = model.convert_dataset_to_features(
-                dev_docs, dev_annotations, logger
+                dev_docs, dev_annotations, logger, add_question=args.add_question, part='dev'
             )
             logger.info("***** Dev *****")
             logger.info("  Num examples = %d", len(dev_features))
-            logger.info("  Batch size = %d", local_config['eval_batch_size'])
+            logger.info("  Batch size = %d", args.eval_batch_size)
             dev_dataloader, dev_clfs_labels_ids, dev_quant_labels_ids = \
-                get_dataloader_and_tensors(dev_features, local_config['eval_batch_size'])
+                get_dataloader_and_tensors(dev_features, args.eval_batch_size)
+
+            test_features = model.convert_dataset_to_features(
+                test_docs, test_annotations, logger, add_question=args.add_question, part='test'
+                )
+            logger.info("***** Test *****")
+            logger.info("  Num examples = %d", len(test_features))
+            logger.info("  Batch size = %d", args.eval_batch_size)
+            test_dataloader, test_clfs_labels_ids, test_quant_labels_ids = \
+                get_dataloader_and_tensors(test_features, args.eval_batch_size)
 
         best_result = 0.0
-
         eval_step = max(1, len(train_batches) // args.eval_per_epoch)
 
         start_time = time.time()
@@ -416,7 +434,7 @@ def main(args):
         model.to(device)
         lr = float(args.learning_rate)
 
-        for epoch in range(1, 1 + local_config['num_train_epochs']):
+        for epoch in range(1, 1 + args.num_train_epochs):
             tr_loss = 0
             nb_tr_examples = 0
             nb_tr_steps = 0
@@ -447,13 +465,13 @@ def main(args):
                 loss = train_loss['total'].mean().item()
                 for key in train_loss:
                     cur_train_loss[key] += train_loss[key].mean().item()
-                train_bar.set_description(f'training... [epoch == {epoch} / {local_config["num_train_epochs"]}, loss == {loss}]')
+                train_bar.set_description(f'training... [epoch == {epoch} / {args.num_train_epochs}, loss == {loss}]')
 
                 loss_to_optimize = train_loss['total']
 
-                if local_config['gradient_accumulation_steps'] > 1:
+                if args.gradient_accumulation_steps > 1:
                     loss_to_optimize = \
-                        loss_to_optimize / local_config['gradient_accumulation_steps']
+                        loss_to_optimize / args.gradient_accumulation_steps
 
                 loss_to_optimize.backward()
                 torch.nn.utils.clip_grad_norm_(
@@ -465,13 +483,13 @@ def main(args):
                 nb_tr_examples += input_ids.size(0)
                 nb_tr_steps += 1
 
-                if (step + 1) % local_config['gradient_accumulation_steps'] == 0:
+                if (step + 1) % args.gradient_accumulation_steps == 0:
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
 
-                if local_config['do_validation'] and (step + 1) % eval_step == 0:
+                if args.do_validation and (step + 1) % eval_step == 0:
                     logger.info(
                         'Ep: {}, Stp: {}/{}, usd_t={:.2f}s, loss={:.6f}'.format(
                             epoch, step + 1, len(train_batches),
@@ -497,7 +515,7 @@ def main(args):
                     metrics['epoch'] = epoch
                     metrics['learning_rate'] = scheduler.get_lr()[0]
                     metrics['batch_size'] = \
-                        local_config['train_batch_size'] * local_config['gradient_accumulation_steps']
+                        args.train_batch_size * args.gradient_accumulation_steps
 
                     for key, value in metrics.items():
                         dev_writer.add_scalar(key, value, global_step)
@@ -527,21 +545,20 @@ def main(args):
                             )
                         )
                         best_result = metrics['score']
-                        output_model_file = os.path.join(
-                            args.output_dir,
-                            WEIGHTS_NAME
-                        )
-                        save_model(args, model, output_model_file)
+                        # output_model_file = os.path.join(
+                        #     args.output_dir,
+                        #     WEIGHTS_NAME
+                        # )
+                        # save_model(args, model, output_model_file)
                         best_dev_predictions = os.path.join(args.output_dir, 'best_dev_predictions')
                         if os.path.exists(best_dev_predictions):
                             os.system(f'rm -r {best_dev_predictions}')
                         os.system(f'mv {dev_predictions} {best_dev_predictions}')
-                        # predict(
-                        #     model, dev_dataloader, os.path.join(args.output_dir, 'best_dev_predictions'),
-                        #     dev_features, args,
-                        #     cur_train_mean_loss=cur_train_mean_loss,
-                        #     logger=eval_logger, compute_metrics=False
-                        # )
+                        test_predictions = os.path.join(args.output_dir, 'best_test_predictions')
+                        predict(
+                            model, test_dataloader, test_predictions,
+                            test_features, args, compute_metrics=False
+                        )
                     dev_writer.add_scalar('best_score', best_result, global_step)
 
             if args.log_train_metrics:
@@ -554,34 +571,35 @@ def main(args):
                 metrics['epoch'] = epoch
                 metrics['learning_rate'] = scheduler.get_lr()[0]
                 metrics['batch_size'] = \
-                    local_config['train_batch_size'] * local_config['gradient_accumulation_steps']
+                    args.train_batch_size * args.gradient_accumulation_steps
 
                 for key, value in metrics.items():
                     train_writer.add_scalar(key, value, global_step)
 
-    if local_config['do_eval']:
-        test_docs, test_annotations = os.path.join(local_config['data_dir'], 'eval/text'), os.path.join(local_config['data_dir'], 'eval/single_sents_tsv')
+    if args.do_eval:
+        assert args.ckpt_path != ''
+        test_docs, test_annotations = args.eval_input_txt_dir, args.eval_input_tsv_dir
         model = models[model_name].from_pretrained(
-            args.output_dir, cache_dir=str(PYTORCH_PRETRAINED_BERT_CACHE),
-            local_config=local_config,
+            args.ckpt_path, cache_dir=str(PYTORCH_PRETRAINED_BERT_CACHE),
+            args=args,
             data_processor=data_processor
         )
         model.to(device)
         test_features = model.convert_dataset_to_features(
-            test_docs, test_annotations, test_logger
+            test_docs, test_annotations, test_logger, add_question=args.add_question, part='test'
         )
         logger.info("***** Test *****")
         logger.info("  Num examples = %d", len(test_features))
-        logger.info("  Batch size = %d", local_config['eval_batch_size'])
+        logger.info("  Batch size = %d", args.eval_batch_size)
 
         test_dataloader, test_clfs_labels_ids, test_quant_labels_ids = \
-            get_dataloader_and_tensors(test_features, local_config['eval_batch_size'])
+            get_dataloader_and_tensors(test_features, args.eval_batch_size)
 
         metrics = predict(
             model, test_dataloader,
-            os.path.join(args.output_dir, 'test_single_sents_predictions'),
+            os.path.join(args.output_dir, args.eval_output_dir),
             test_features, args,
-            compute_metrics=True
+            compute_metrics=False
         )
 
 
@@ -605,11 +623,24 @@ def save_model(args, model, output_model_file):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--test_dir", default='', type=str, required=False)
-    parser.add_argument("--model_name", default='bert-large-uncased', type=str, required=True)
-    parser.add_argument("--output_dir", default=None, type=str, required=True,
-                        help="The output directory where the model predictions and checkpoints will be written.")
 
+    parser.add_argument("--do_train", action='store_true', help='Whether to run training')
+    parser.add_argument("--do_validation", action='store_true',
+                        help='Whether to validate model during training process')
+    parser.add_argument("--do_eval", action='store_true', help='Whether to run evaluation')
+
+    parser.add_argument("--model_name", default='roberta-large', type=str, required=False)
+    parser.add_argument("--data_dir", default='../MeasEval/data/', type=str)
+    parser.add_argument("--output_dir", default=None, type=str, required=False,
+                        help="The output directory where the model predictions and checkpoints will be written.")
+    parser.add_argument("--eval_input_tsv_dir", default='', help='Directory containing .data files to predict')
+    parser.add_argument("--eval_input_txt_dir", default='', help='Directory containing .data files to predict')
+    parser.add_argument("--eval_output_dir", default='',
+                        help='Subdirectory name where predictions will be saved')
+    parser.add_argument("--ckpt_path", type=str, default='', help='Path to directory containig pytorch.bin checkpoint')
+
+    parser.add_argument("--learning_rate", default=1e-5, type=float,
+                        help="The initial learning rate for Adam.")
     parser.add_argument("--eval_per_epoch", default=4, type=int,
                         help="How many times to do validation on dev set per epoch")
     parser.add_argument("--max_seq_length", default=256, type=int,
@@ -620,15 +651,11 @@ if __name__ == "__main__":
     parser.add_argument("--train_mode", type=str, default='random_sorted',
                         choices=['random', 'sorted', 'random_sorted'])
 
-    parser.add_argument("--learning_rate", default=1e-5, type=float,
-                        help="The initial learning rate for Adam.")
-
     parser.add_argument("--warmup_proportion", default=0.1, type=float,
                         help="Proportion of training to perform linear learning rate warmup.\n"
                              "E.g., 0.1 = 10%% of training.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="maximal gradient norm")
-
     parser.add_argument("--weight_decay", default=0.1, type=float,
                         help="weight_decay coefficient for regularization")
     parser.add_argument("--dropout", default=0.1, type=float,
@@ -636,14 +663,40 @@ if __name__ == "__main__":
 
     parser.add_argument("--no_cuda", action='store_true',
                         help="Whether not to use CUDA when available")
-    parser.add_argument('--seed', type=int, default=42,
+    parser.add_argument('--seed', type=int, default=2021,
                         help="random seed for initialization")
     parser.add_argument("--log_train_metrics", action="store_true",
                         help="compute metrics for train set too")
 
-    parser.add_argument("--local_config_path", type=str, default='local_config.json',
-                        help="local config path")
-    parser.add_argument("--weighting_mode", default='softmax', type=str, required=False)
+    parser.add_argument("--weighting_mode", default='softmax',
+                        type=str, required=False, choices=['softmax', 'equal', 'rsqr+log'])
+
+    parser.add_argument("--pool_type", default='max', type=str, choices=['max', 'mean', 'first'])
+    parser.add_argument("--lr_scheduler", default='linear_warmup', type=str, choices=['linear_warmup', 'constant_warmup'])
+
+    parser.add_argument("--concat_quantity_embeddings", default=False, type=bool)
+    parser.add_argument("--gradient_accumulation_steps", default=32, type=int)
+    parser.add_argument("--train_batch_size", default=128, type=int)
+    parser.add_argument("--num_train_epochs", default=50, type=int)
+    parser.add_argument("--eval_batch_size", default=32, type=int)
+    parser.add_argument("--quant_ncls", default=10, type=int)
+    parser.add_argument("--max_seq_len", default=256, type=int)
+    parser.add_argument("--clfs", default='', type=str)
+
+    parser.add_argument("--dont_split_qualifier", action='store_true')
+    parser.add_argument(
+        "--quant_classes",
+        default=[
+             "HasTolerance", "IsApproximate", "IsCount", "IsList", "IsMean", "IsMeanHasTolerance",
+             "IsMeanIsRange", "IsMedian", "IsRange", "IsRangeHasTolerance"
+        ],
+        type=list
+    )
+    parser.add_argument("--add_double_sentences", default='true', type=str, help="If true augmentation will be performed "
+        "by inclusion of two sentences following each other")
+    parser.add_argument("--add_question", default='Find measured entities and properties of marked quantity', type=str,
+        help="Qustion to add before the sentence.")
+
 
     parsed_args = parser.parse_args()
     main(parsed_args)

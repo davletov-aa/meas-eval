@@ -25,25 +25,24 @@ class RobertaForQA(BertPreTrainedModel):
     def __init__(
             self,
             config: RobertaConfig,
-            local_config: dict,
+            args,
             data_processor
         ):
         super().__init__(config)
 
         self.roberta = RobertaModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.local_config = local_config
-        clfs = sorted(local_config['clfs'])
-        self.tokenizer = RobertaTokenizer.from_pretrained(local_config['model_name'])
+        self.args = args
+        clfs = sorted(args.clfs)
+        self.tokenizer = RobertaTokenizer.from_pretrained(args.model_name)
         self.clf2ncls = [2 for clf in clfs]
-        if local_config['concat_quantity_embeddings']:
+        if args.concat_quantity_embeddings:
             self.clfs = nn.Linear(config.hidden_size * 2, sum(self.clf2ncls))
-            self.quant_clf = nn.Linear(config.hidden_size * 2, self.local_config['quant_ncls'])
+            self.quant_clf = nn.Linear(config.hidden_size * 2, self.args.quant_ncls)
         else:
             self.clfs = nn.Linear(config.hidden_size, sum(self.clf2ncls))
-            self.quant_clf = nn.Linear(config.hidden_size, self.local_config['quant_ncls'])
+            self.quant_clf = nn.Linear(config.hidden_size, self.args.quant_ncls)
         self.clfs_weights = torch.nn.parameter.Parameter(torch.ones(len(clfs) + 1, dtype=torch.float32), requires_grad=True)
-#         self.clfs_weights = torch.nn.parameter.Parameter(torch.rand(len(clfs) + 1, dtype=torch.float32) + 1e-6, requires_grad=True)
         print(self.clfs_weights)
 
         self.data_processor = data_processor
@@ -64,7 +63,7 @@ class RobertaForQA(BertPreTrainedModel):
             input_labels=None,
             weighting_mode='softmax'
     ):
-        assert weighting_mode in ['softmax', 'rsqs+log', 'equal'], f'wrong weighting_mode: {weighting_mode}'
+        assert weighting_mode in ['softmax', 'rsqr+log', 'equal'], f'wrong weighting_mode: {weighting_mode}'
         loss = defaultdict(float)
         outputs = self.roberta(
             input_ids,
@@ -75,7 +74,7 @@ class RobertaForQA(BertPreTrainedModel):
             inputs_embeds=inputs_embeds,
         )
 
-        clfs = sorted(self.local_config['clfs'])
+        clfs = sorted(self.args.clfs)
         sequences_output = self.dropout(outputs[0])  # bs x seq x hidden
         weights = self.clfs_weights
 
@@ -84,7 +83,7 @@ class RobertaForQA(BertPreTrainedModel):
 
         clfs_labels = torch.split(labels, self.clf2ncls, dim=-1)  # len(clfs) x bs x clf_ncls
 
-        if self.local_config['concat_quantity_embeddings']:
+        if self.args.concat_quantity_embeddings:
             pos = [i for i, clf in enumerate(clfs) if clf == 'Quantity'][0]
             sequences_output = self.concat_quantity_embeddings(sequences_output, clfs_labels[pos])
 
@@ -130,9 +129,9 @@ class RobertaForQA(BertPreTrainedModel):
         return outputs
 
     def concat_quantity_embeddings(self, hidden_states, quant_labels):
-        pool_type = self.local_config['pool_type']
+        pool_type = self.args.pool_type
         bs, seq, hs = hidden_states.size()
-        device = torch.device('cuda') if self.local_config['use_cuda'] else torch.device('cpu')
+        device = torch.device('cuda') if self.args.use_cuda else torch.device('cpu')
         output = torch.zeros(bs, seq, 2 * hs, dtype=torch.float32, device=device)
         output[:, :, :hs] = hidden_states
         for ex_id in range(bs):
@@ -143,6 +142,8 @@ class RobertaForQA(BertPreTrainedModel):
                     quant_emb = hidden_states[ex_id, start:end+1].mean(dim=0)
                 elif pool_type == 'max':
                     quant_emb, _ = hidden_states[ex_id, start:end+1].max(dim=0)
+                elif pool_type == 'first':
+                    quant_emb = hidden_states[ex_id, start]
                 else:
                     raise ValueError(f'wrong pool_type: {pool_type}')
                 output[:, :, hs:] = quant_emb
@@ -152,25 +153,25 @@ class RobertaForQA(BertPreTrainedModel):
 
 
     def convert_dataset_to_features(
-            self, docs, annotations, logger, add_question='Find measured entities and properties of marked quantity'
+            self, docs, annotations, logger, add_question='Find measured entities and properties of marked quantity', part='train'
     ):
         """Loads a data file into a list of `InputBatch`s."""
         # add_question = ''
-        clfs = sorted(self.local_config['clfs'])
+        clfs = sorted(self.args.clfs)
         if add_question:
             question_tokens = self.tokenizer.tokenize(add_question)
             logger.info(f'question_tokens: {question_tokens}')
 
         features = []
         num_shown_examples = 0
-        max_seq_len = self.local_config['max_seq_len']
+        max_seq_len = self.args.max_seq_len
         num_too_long_examples = 0
 
-        quant_lab_to_id = {lab: i for i, lab in enumerate(sorted(self.local_config['quant_classes']))}
-        quant_id_to_lab = {i: lab for i, lab in enumerate(sorted(self.local_config['quant_classes']))}
+        quant_lab_to_id = {lab: i for i, lab in enumerate(sorted(self.args.quant_classes))}
+        quant_id_to_lab = {i: lab for i, lab in enumerate(sorted(self.args.quant_classes))}
         logger.info(f'quant_lab_to_id: {quant_lab_to_id}')
 
-        examples = self.data_processor.create_qa_examples(docs, annotations)
+        examples = self.data_processor.create_qa_examples(docs, annotations, part=part)
 
         for (ex_index, example) in enumerate(examples):
 
@@ -178,7 +179,7 @@ class RobertaForQA(BertPreTrainedModel):
             if add_question:
                 tokens += question_tokens + [self.tokenizer.sep_token]
 
-            quant_labels = [1 if quant_lab in example.mods.split('+') else 0 for quant_lab in sorted(self.local_config['quant_classes'])]
+            quant_labels = [1 if quant_lab in example.mods.split('+') else 0 for quant_lab in sorted(self.args.quant_classes)]
 
             clfs_labels = [0] * (2 * len(clfs))
             clfs_labels_starts = {}

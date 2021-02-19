@@ -29,7 +29,7 @@ class DataProcessor:
         self.tokenizer = RegexpTokenizer(r'\w+|\(|\)|\[|\]|[-–.,]|\S+')
 
 
-    def get_dataframes(self, docs_dir, annotations_dir=None):
+    def get_dataframes(self, docs_dir, annotations_dir=None, part='train'):
 
         from collections import namedtuple
         Sentence = namedtuple('Sentence', ['start', 'end', 'text'])
@@ -50,7 +50,7 @@ class DataProcessor:
                 )
             ]
         )
-        if self.add_double_sentences:
+        if self.add_double_sentences and not part != 'train':
             docs.loc[:, 'texts'] = docs.apply(
                 lambda r: r.texts + [
                     Sentence(
@@ -237,8 +237,8 @@ class DataProcessor:
         AnnotatedToken = namedtuple('AnnotatedToken', ['start', 'end', 'text', 'label'])
         return [AnnotatedToken(tok.start, tok.end, tok.text, label) for tok, label in zip(tokens, labels)]
     
-    def create_qa_examples(self, docs_dir, annots_dir):
-        docs, annots = self.get_dataframes(docs_dir, annots_dir)
+    def create_qa_examples(self, docs_dir, annots_dir, part='train'):
+        docs, annots = self.get_dataframes(docs_dir, annots_dir, part=part)
         docs = docs[docs.docId.isin(annots.docId.unique())]
         Example = namedtuple('Example', ['docId', 'tokens', 'mods', 'sent'])
 
@@ -272,6 +272,7 @@ class DataProcessor:
                     tokens = self.tokenize_sent_with_spans(sent.text)
                     example = {}
                     labels = {}
+
                     for annotType in spans_types:
                         if annotType == 'Qualifier':
                             annot_start = quant_annots[quant_annots.annotType == annotType].startOffset.values[0]
